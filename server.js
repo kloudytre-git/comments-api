@@ -1,10 +1,12 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
 
 const app = express();
+app.use(helmet());
 app.use(express.json());
 
 // Only allow requests from your portfolio's origin (set this in Render's env vars)
@@ -55,6 +57,25 @@ function checkAdmin(req, res) {
   return true;
 }
 
+// Basic anti-spam: max 5 posted comments per IP every 15 minutes
+const postLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many comments from this IP. Please try again later.' },
+});
+
+// Slow down brute-force guessing of ADMIN_KEY: max 10 attempts per IP every 15 minutes.
+// Applied to every endpoint that checks x-admin-key (publish post, delete post, delete comment).
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts from this IP. Please try again later.' },
+});
+
 // Health check (also what Render pings to keep the service "alive enough")
 app.get('/', (req, res) => res.send('Comments API is running.'));
 
@@ -96,7 +117,7 @@ app.get('/api/posts/:id', async (req, res) => {
 });
 
 // POST /api/posts — create a new post. Admin only (x-admin-key header).
-app.post('/api/posts', async (req, res) => {
+app.post('/api/posts', adminLimiter, async (req, res) => {
   if (!checkAdmin(req, res)) return;
 
   const { category, title, summary, content } = req.body || {};
@@ -132,7 +153,7 @@ app.post('/api/posts', async (req, res) => {
 });
 
 // DELETE /api/posts/:id — admin only. Also deletes that post's comments (ON DELETE CASCADE).
-app.delete('/api/posts/:id', async (req, res) => {
+app.delete('/api/posts/:id', adminLimiter, async (req, res) => {
   if (!checkAdmin(req, res)) return;
   try {
     await pool.query('DELETE FROM posts WHERE id = $1', [req.params.id]);
@@ -164,15 +185,6 @@ app.get('/api/comments', async (req, res) => {
   }
 });
 
-// Basic anti-spam: max 5 posted comments per IP every 15 minutes
-const postLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many comments from this IP. Please try again later.' },
-});
-
 // POST /api/comments — create a new comment, optionally scoped to a post via post_id
 app.post('/api/comments', postLimiter, async (req, res) => {
   const { name, text, post_id } = req.body || {};
@@ -202,7 +214,7 @@ app.post('/api/comments', postLimiter, async (req, res) => {
 
 // DELETE /api/comments/:id — moderation endpoint, protected by a secret key
 // Call this with header  x-admin-key: <your ADMIN_KEY>  to remove spam/abuse
-app.delete('/api/comments/:id', async (req, res) => {
+app.delete('/api/comments/:id', adminLimiter, async (req, res) => {
   if (!checkAdmin(req, res)) return;
   try {
     await pool.query('DELETE FROM comments WHERE id = $1', [req.params.id]);
